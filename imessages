@@ -1,0 +1,828 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+
+#
+# imessages - CLI for reading and sending iMessages
+#
+# Usage:
+#   imessages threads  [--limit 20] [--since DATE]
+#   imessages thread   <contact> [--limit 50] [--since DATE]
+#   imessages search   <query> [--limit 20] [--from CONTACT]
+#   imessages send     <contact> <message>
+#   imessages chats    [--limit 20]
+#   imessages chat     <chat_id> [--limit 50]
+#   imessages contacts <query>
+#   imessages aliases
+#
+# Contact can be a phone number (+1234567890), an alias from aliases.yml,
+# or a name to search in Contacts.app.
+#
+# All read operations query ~/Library/Messages/chat.db directly.
+# Send uses AppleScript via osascript.
+#
+# Output: single-line JSON to stdout
+
+require 'bundler/setup'
+require 'json'
+require 'sqlite3'
+require 'optparse'
+require 'yaml'
+require 'open3'
+require 'time'
+
+DB_PATH = File.expand_path("~/Library/Messages/chat.db")
+ALIASES_PATH = File.join(__dir__, "aliases.yml")
+
+# Apple CoreData nanosecond timestamp epoch (2001-01-01 00:00:00 UTC)
+APPLE_EPOCH_OFFSET = 978307200
+NANOSECOND_FACTOR = 1_000_000_000
+
+# --------------------------------------------------------------------------
+# Output helpers
+# --------------------------------------------------------------------------
+
+def output(data)
+  puts JSON.generate(data)
+end
+
+def success(data)
+  output(ok: true, data: data)
+  exit 0
+end
+
+def error(msg, code = 'ERROR', details = nil)
+  output(ok: false, error: msg, code: code, details: details)
+  exit 1
+end
+
+# --------------------------------------------------------------------------
+# Date helpers
+# --------------------------------------------------------------------------
+
+def apple_to_time(apple_ns)
+  return nil if apple_ns.nil? || apple_ns == 0
+  unix = (apple_ns.to_f / NANOSECOND_FACTOR) + APPLE_EPOCH_OFFSET
+  Time.at(unix).localtime
+end
+
+def apple_to_iso(apple_ns)
+  t = apple_to_time(apple_ns)
+  t&.iso8601
+end
+
+def date_to_apple_ns(date_str)
+  t = Time.parse(date_str)
+  ((t.to_f - APPLE_EPOCH_OFFSET) * NANOSECOND_FACTOR).to_i
+end
+
+# --------------------------------------------------------------------------
+# Database
+# --------------------------------------------------------------------------
+
+def open_db
+  error("Messages database not found at #{DB_PATH}", 'NOT_FOUND') unless File.exist?(DB_PATH)
+  SQLite3::Database.new(DB_PATH, results_as_hash: true, readonly: true)
+end
+
+# --------------------------------------------------------------------------
+# Contact / alias resolution
+# --------------------------------------------------------------------------
+
+def load_aliases
+  return {} unless File.exist?(ALIASES_PATH)
+  data = YAML.load_file(ALIASES_PATH) || {}
+  # Normalize keys to lowercase
+  data.transform_keys(&:downcase)
+rescue => e
+  {}
+end
+
+def search_contacts_app(query)
+  script = <<~APPLESCRIPT
+    tell application "Contacts"
+      set output to ""
+      set matchedPeople to (every person whose name contains "#{query.gsub('"', '\\"')}")
+      repeat with p in matchedPeople
+        set pName to name of p
+        set pPhones to {}
+        repeat with ph in (every phone of p)
+          set end of pPhones to (label of ph) & ":" & (value of ph)
+        end repeat
+        set pEmails to {}
+        repeat with em in (every email of p)
+          set end of pEmails to (label of em) & ":" & (value of em)
+        end repeat
+        set phoneStr to ""
+        repeat with i from 1 to count of pPhones
+          if i > 1 then set phoneStr to phoneStr & ";"
+          set phoneStr to phoneStr & (item i of pPhones)
+        end repeat
+        set emailStr to ""
+        repeat with i from 1 to count of pEmails
+          if i > 1 then set emailStr to emailStr & ";"
+          set emailStr to emailStr & (item i of pEmails)
+        end repeat
+        set output to output & pName & "\\t" & phoneStr & "\\t" & emailStr & "\\n"
+      end repeat
+      return output
+    end tell
+  APPLESCRIPT
+
+  stdout, stderr, status = Open3.capture3('osascript', '-e', script)
+  unless status.success?
+    error("Contacts.app search failed: #{stderr.strip}", 'CONTACTS_ERROR')
+  end
+
+  results = []
+  stdout.strip.split("\n").each do |line|
+    next if line.strip.empty?
+    parts = line.split("\t", -1)
+    name = parts[0]&.strip
+    phones = (parts[1] || "").split(";").map do |p|
+      label, value = p.split(":", 2)
+      { label: label&.strip, value: value&.strip }
+    end.reject { |p| p[:value].nil? || p[:value].empty? }
+    emails = (parts[2] || "").split(";").map do |e|
+      label, value = e.split(":", 2)
+      { label: label&.strip, value: value&.strip }
+    end.reject { |e| e[:value].nil? || e[:value].empty? }
+    results << { name: name, phones: phones, emails: emails }
+  end
+  results
+end
+
+def looks_like_phone?(str)
+  str.match?(/\A\+?\d[\d\s\-()]{6,}\z/)
+end
+
+def normalize_phone(str)
+  digits = str.gsub(/[^\d+]/, '')
+  digits = "+1#{digits}" if digits.length == 10 && !digits.start_with?('+')
+  digits = "+#{digits}" unless digits.start_with?('+')
+  digits
+end
+
+# Resolve a contact string to a phone number.
+# Returns { phone: "+1...", name: "...", source: "direct|alias|contacts" }
+# or raises an error with disambiguation options.
+def resolve_contact(input)
+  return { phone: normalize_phone(input), name: nil, source: 'direct' } if looks_like_phone?(input)
+
+  # Check aliases
+  aliases = load_aliases
+  key = input.downcase.strip
+  if aliases[key]
+    entry = aliases[key]
+    if entry.is_a?(Hash)
+      return { phone: normalize_phone(entry['phone']), name: entry['name'] || key, source: 'alias' }
+    else
+      return { phone: normalize_phone(entry.to_s), name: key, source: 'alias' }
+    end
+  end
+
+  # Search Contacts.app
+  results = search_contacts_app(input)
+  if results.empty?
+    error("No contact found for '#{input}'. Add an alias in aliases.yml or use a phone number.", 'NOT_FOUND')
+  elsif results.length == 1
+    contact = results.first
+    phone = contact[:phones].first
+    error("Contact '#{contact[:name]}' has no phone number.", 'NO_PHONE') unless phone
+    return { phone: normalize_phone(phone[:value]), name: contact[:name], source: 'contacts' }
+  else
+    # Multiple matches — return them for disambiguation
+    error(
+      "Multiple contacts match '#{input}'. Be more specific or add an alias.",
+      'AMBIGUOUS',
+      results.map { |c| { name: c[:name], phones: c[:phones].map { |p| p[:value] } } }
+    )
+  end
+end
+
+# --------------------------------------------------------------------------
+# Handle name resolution (from Messages DB handle IDs to display names)
+# --------------------------------------------------------------------------
+
+def build_handle_map(db)
+  handles = {}
+  db.execute("SELECT ROWID, id, service FROM handle").each do |row|
+    handles[row['ROWID']] = { id: row['id'], service: row['service'] }
+  end
+  handles
+end
+
+def resolve_handle_name(handle_id_str)
+  # Try to find a name in Contacts.app for a phone/email
+  return nil if handle_id_str.nil? || handle_id_str.empty?
+
+  # Cache results in a class variable equivalent
+  @handle_name_cache ||= {}
+  return @handle_name_cache[handle_id_str] if @handle_name_cache.key?(handle_id_str)
+
+  script = <<~APPLESCRIPT
+    tell application "Contacts"
+      set matchedPeople to (every person whose value of every phone contains "#{handle_id_str.gsub('"', '\\"')}")
+      if (count of matchedPeople) > 0 then
+        return name of (item 1 of matchedPeople)
+      end if
+      set matchedPeople to (every person whose value of every email contains "#{handle_id_str.gsub('"', '\\"')}")
+      if (count of matchedPeople) > 0 then
+        return name of (item 1 of matchedPeople)
+      end if
+      return ""
+    end tell
+  APPLESCRIPT
+
+  stdout, _, status = Open3.capture3('osascript', '-e', script)
+  name = status.success? ? stdout.strip : nil
+  name = nil if name == ""
+  @handle_name_cache[handle_id_str] = name
+  name
+end
+
+# Batch resolve names for a set of handle IDs to avoid N+1 AppleScript calls.
+# Returns { handle_id_string => "Contact Name" or nil }
+def batch_resolve_names(handle_ids)
+  @handle_name_cache ||= {}
+  to_resolve = handle_ids.uniq.reject { |id| @handle_name_cache.key?(id) }
+
+  to_resolve.each do |hid|
+    resolve_handle_name(hid)
+  end
+
+  handle_ids.each_with_object({}) do |hid, map|
+    map[hid] = @handle_name_cache[hid]
+  end
+end
+
+def display_name_for_handle(handle_id_str)
+  name = resolve_handle_name(handle_id_str)
+  name || handle_id_str
+end
+
+# --------------------------------------------------------------------------
+# Commands
+# --------------------------------------------------------------------------
+
+def cmd_threads(options)
+  db = open_db
+  limit = options[:limit] || 20
+  since_clause = ""
+  params = []
+
+  if options[:since]
+    since_ns = date_to_apple_ns(options[:since])
+    since_clause = "AND m.date >= ?"
+    params << since_ns
+  end
+
+  # Get most recent message per chat (1:1 chats only, style=45)
+  rows = db.execute(<<~SQL, params)
+    SELECT
+      c.ROWID as chat_id,
+      c.chat_identifier,
+      c.display_name,
+      c.service_name,
+      c.style,
+      h.id as handle_id,
+      MAX(m.date) as last_date,
+      COUNT(m.ROWID) as message_count
+    FROM chat c
+    JOIN chat_message_join cmj ON cmj.chat_id = c.ROWID
+    JOIN message m ON m.ROWID = cmj.message_id #{since_clause}
+    LEFT JOIN chat_handle_join chj ON chj.chat_id = c.ROWID
+    LEFT JOIN handle h ON h.ROWID = chj.handle_id
+    WHERE c.style = 45
+    GROUP BY c.ROWID
+    ORDER BY last_date DESC
+    LIMIT #{limit.to_i}
+  SQL
+
+  # Collect handle IDs for batch resolution
+  handle_ids = rows.map { |r| r['handle_id'] }.compact.uniq
+  batch_resolve_names(handle_ids)
+
+  # Get last message text for each chat
+  threads = rows.map do |row|
+    last_msg = db.execute(<<~SQL, [row['chat_id']]).first
+      SELECT m.text, m.is_from_me, m.date
+      FROM message m
+      JOIN chat_message_join cmj ON cmj.message_id = m.ROWID
+      WHERE cmj.chat_id = ?
+      ORDER BY m.date DESC
+      LIMIT 1
+    SQL
+
+    {
+      chat_id: row['chat_id'],
+      handle: row['handle_id'] || row['chat_identifier'],
+      contact_name: row['handle_id'] ? resolve_handle_name(row['handle_id']) : nil,
+      display_name: row['display_name']&.empty? ? nil : row['display_name'],
+      service: row['service_name'],
+      message_count: row['message_count'],
+      last_message_date: apple_to_iso(row['last_date']),
+      last_message: last_msg ? {
+        text: last_msg['text'],
+        is_from_me: last_msg['is_from_me'] == 1,
+        date: apple_to_iso(last_msg['date'])
+      } : nil
+    }
+  end
+
+  success(threads: threads, count: threads.length)
+end
+
+def cmd_thread(contact_input, options)
+  resolved = resolve_contact(contact_input)
+  phone = resolved[:phone]
+  db = open_db
+  limit = options[:limit] || 50
+  since_clause = ""
+  params = []
+
+  if options[:since]
+    since_ns = date_to_apple_ns(options[:since])
+    since_clause = "AND m.date >= ?"
+    params << since_ns
+  end
+
+  # Find handle(s) matching this phone
+  phone_variants = [phone, phone.sub(/^\+1/, ''), phone.sub(/^\+/, '')]
+  placeholders = phone_variants.map { '?' }.join(', ')
+
+  handle_rows = db.execute(
+    "SELECT ROWID, id, service FROM handle WHERE id IN (#{placeholders})",
+    phone_variants
+  )
+
+  if handle_rows.empty?
+    error("No message history found for #{phone}", 'NOT_FOUND')
+  end
+
+  handle_ids = handle_rows.map { |r| r['ROWID'] }
+  handle_placeholders = handle_ids.map { '?' }.join(', ')
+
+  rows = db.execute(<<~SQL, handle_ids + params)
+    SELECT
+      m.ROWID,
+      m.guid,
+      m.text,
+      m.is_from_me,
+      m.date,
+      m.date_read,
+      m.date_delivered,
+      m.service,
+      m.cache_has_attachments,
+      m.associated_message_type,
+      m.thread_originator_guid,
+      h.id as handle_id
+    FROM message m
+    LEFT JOIN handle h ON m.handle_id = h.ROWID
+    WHERE m.handle_id IN (#{handle_placeholders}) #{since_clause}
+    ORDER BY m.date DESC
+    LIMIT #{limit.to_i}
+  SQL
+
+  messages = rows.reverse.map do |row|
+    msg = {
+      id: row['ROWID'],
+      guid: row['guid'],
+      text: row['text'],
+      is_from_me: row['is_from_me'] == 1,
+      date: apple_to_iso(row['date']),
+      service: row['service'],
+    }
+    msg[:has_attachments] = true if row['cache_has_attachments'] == 1
+
+    # Include attachment details
+    if row['cache_has_attachments'] == 1
+      attachments = db.execute(<<~SQL, [row['ROWID']])
+        SELECT a.filename, a.mime_type, a.transfer_name, a.total_bytes
+        FROM attachment a
+        JOIN message_attachment_join maj ON maj.attachment_id = a.ROWID
+        WHERE maj.message_id = ?
+      SQL
+      unless attachments.empty?
+        msg[:attachments] = attachments.map do |a|
+          {
+            filename: a['transfer_name'] || a['filename'],
+            mime_type: a['mime_type'],
+            bytes: a['total_bytes']
+          }
+        end
+      end
+    end
+
+    msg
+  end
+
+  success(
+    contact: {
+      phone: phone,
+      name: resolved[:name],
+      source: resolved[:source]
+    },
+    messages: messages,
+    count: messages.length
+  )
+end
+
+def cmd_search(query, options)
+  db = open_db
+  limit = options[:limit] || 20
+  conditions = ["m.text LIKE ?"]
+  params = ["%#{query}%"]
+
+  if options[:from]
+    resolved = resolve_contact(options[:from])
+    phone = resolved[:phone]
+    phone_variants = [phone, phone.sub(/^\+1/, ''), phone.sub(/^\+/, '')]
+    placeholders = phone_variants.map { '?' }.join(', ')
+    conditions << "h.id IN (#{placeholders})"
+    params.concat(phone_variants)
+  end
+
+  where = conditions.join(" AND ")
+
+  rows = db.execute(<<~SQL, params)
+    SELECT
+      m.ROWID,
+      m.text,
+      m.is_from_me,
+      m.date,
+      m.service,
+      h.id as handle_id,
+      c.chat_identifier,
+      c.display_name as chat_name,
+      c.style
+    FROM message m
+    LEFT JOIN handle h ON m.handle_id = h.ROWID
+    LEFT JOIN chat_message_join cmj ON cmj.message_id = m.ROWID
+    LEFT JOIN chat c ON c.ROWID = cmj.chat_id
+    WHERE #{where}
+    ORDER BY m.date DESC
+    LIMIT #{limit.to_i}
+  SQL
+
+  # Batch resolve names
+  handle_ids = rows.map { |r| r['handle_id'] }.compact.uniq
+  batch_resolve_names(handle_ids)
+
+  messages = rows.map do |row|
+    {
+      id: row['ROWID'],
+      text: row['text'],
+      is_from_me: row['is_from_me'] == 1,
+      date: apple_to_iso(row['date']),
+      service: row['service'],
+      handle: row['handle_id'],
+      contact_name: row['handle_id'] ? @handle_name_cache[row['handle_id']] : nil,
+      chat: row['chat_identifier'],
+      chat_name: row['chat_name']&.empty? ? nil : row['chat_name'],
+      is_group: row['style'] == 43
+    }
+  end
+
+  success(messages: messages, count: messages.length, query: query)
+end
+
+def cmd_send(contact_input, message_text)
+  error("Message text is required", 'USAGE') if message_text.nil? || message_text.strip.empty?
+
+  resolved = resolve_contact(contact_input)
+  phone = resolved[:phone]
+
+  # Escape for AppleScript
+  escaped_message = message_text.gsub('\\', '\\\\\\\\').gsub('"', '\\"')
+  escaped_phone = phone.gsub('"', '\\"')
+
+  script = <<~APPLESCRIPT
+    tell application "Messages"
+      set targetService to 1st account whose service type = iMessage
+      set targetBuddy to participant "#{escaped_phone}" of targetService
+      send "#{escaped_message}" to targetBuddy
+    end tell
+  APPLESCRIPT
+
+  stdout, stderr, status = Open3.capture3('osascript', '-e', script)
+  unless status.success?
+    # Try SMS service as fallback
+    sms_script = <<~APPLESCRIPT
+      tell application "Messages"
+        set targetService to 1st account whose service type = SMS
+        set targetBuddy to participant "#{escaped_phone}" of targetService
+        send "#{escaped_message}" to targetBuddy
+      end tell
+    APPLESCRIPT
+
+    stdout2, stderr2, status2 = Open3.capture3('osascript', '-e', sms_script)
+    unless status2.success?
+      error("Failed to send message: #{stderr.strip} / #{stderr2.strip}", 'SEND_FAILED')
+    end
+  end
+
+  success(
+    sent: true,
+    to: {
+      phone: phone,
+      name: resolved[:name],
+      source: resolved[:source]
+    },
+    message: message_text
+  )
+end
+
+def cmd_send_group(chat_id, message_text)
+  error("Message text is required", 'USAGE') if message_text.nil? || message_text.strip.empty?
+
+  db = open_db
+  chat = db.execute("SELECT ROWID, chat_identifier, display_name, service_name FROM chat WHERE ROWID = ?", [chat_id.to_i]).first
+  error("Chat #{chat_id} not found", 'NOT_FOUND') unless chat
+
+  escaped_message = message_text.gsub('\\', '\\\\\\\\').gsub('"', '\\"')
+  chat_identifier = chat['chat_identifier'].gsub('"', '\\"')
+  service = chat['service_name'] || 'iMessage'
+
+  script = <<~APPLESCRIPT
+    tell application "Messages"
+      set targetChat to chat id "#{service};+;#{chat_identifier}"
+      send "#{escaped_message}" to targetChat
+    end tell
+  APPLESCRIPT
+
+  stdout, stderr, status = Open3.capture3('osascript', '-e', script)
+
+  # If that didn't work, try finding the chat by iterating
+  unless status.success?
+    # Try with the raw chat guid from the DB
+    chat_guid = chat['chat_identifier']
+    script2 = <<~APPLESCRIPT
+      tell application "Messages"
+        repeat with aChat in every chat
+          if id of aChat contains "#{chat_guid.gsub('"', '\\"')}" then
+            send "#{escaped_message}" to aChat
+            return "sent"
+          end if
+        end repeat
+        return "not_found"
+      end tell
+    APPLESCRIPT
+
+    stdout2, stderr2, status2 = Open3.capture3('osascript', '-e', script2)
+    if !status2.success? || stdout2.strip == "not_found"
+      error("Failed to send to group chat #{chat_id}: #{stderr.strip}", 'SEND_FAILED')
+    end
+  end
+
+  success(
+    sent: true,
+    chat_id: chat_id.to_i,
+    chat_name: chat['display_name']&.empty? ? nil : chat['display_name'],
+    message: message_text
+  )
+end
+
+def cmd_chats(options)
+  db = open_db
+  limit = options[:limit] || 20
+
+  rows = db.execute(<<~SQL, [limit.to_i])
+    SELECT
+      c.ROWID as chat_id,
+      c.chat_identifier,
+      c.display_name,
+      c.service_name,
+      c.style,
+      MAX(cmj.message_date) as last_date,
+      COUNT(cmj.message_id) as message_count
+    FROM chat c
+    JOIN chat_message_join cmj ON cmj.chat_id = c.ROWID
+    GROUP BY c.ROWID
+    ORDER BY last_date DESC
+    LIMIT ?
+  SQL
+
+  chats = rows.map do |row|
+    chat = {
+      chat_id: row['chat_id'],
+      identifier: row['chat_identifier'],
+      display_name: row['display_name']&.empty? ? nil : row['display_name'],
+      service: row['service_name'],
+      is_group: row['style'] == 43,
+      message_count: row['message_count'],
+      last_message_date: apple_to_iso(row['last_date'])
+    }
+
+    # Get participants
+    participants = db.execute(<<~SQL, [row['chat_id']])
+      SELECT h.id, h.service
+      FROM handle h
+      JOIN chat_handle_join chj ON chj.handle_id = h.ROWID
+      WHERE chj.chat_id = ?
+    SQL
+
+    chat[:participants] = participants.map { |p| p['id'] }
+    chat
+  end
+
+  success(chats: chats, count: chats.length)
+end
+
+def cmd_chat(chat_id, options)
+  db = open_db
+  limit = options[:limit] || 50
+  since_clause = ""
+  params = [chat_id.to_i]
+
+  if options[:since]
+    since_ns = date_to_apple_ns(options[:since])
+    since_clause = "AND m.date >= ?"
+    params << since_ns
+  end
+
+  chat = db.execute("SELECT ROWID, chat_identifier, display_name, service_name, style FROM chat WHERE ROWID = ?", [chat_id.to_i]).first
+  error("Chat #{chat_id} not found", 'NOT_FOUND') unless chat
+
+  # Get participants
+  participants = db.execute(<<~SQL, [chat_id.to_i])
+    SELECT h.id, h.service
+    FROM handle h
+    JOIN chat_handle_join chj ON chj.handle_id = h.ROWID
+    WHERE chj.chat_id = ?
+  SQL
+
+  # Batch resolve participant names
+  participant_ids = participants.map { |p| p['id'] }
+  batch_resolve_names(participant_ids)
+
+  rows = db.execute(<<~SQL, params)
+    SELECT
+      m.ROWID,
+      m.guid,
+      m.text,
+      m.is_from_me,
+      m.date,
+      m.service,
+      m.cache_has_attachments,
+      h.id as handle_id
+    FROM message m
+    LEFT JOIN handle h ON m.handle_id = h.ROWID
+    JOIN chat_message_join cmj ON cmj.message_id = m.ROWID
+    WHERE cmj.chat_id = ? #{since_clause}
+    ORDER BY m.date DESC
+    LIMIT #{limit.to_i}
+  SQL
+
+  messages = rows.reverse.map do |row|
+    msg = {
+      id: row['ROWID'],
+      text: row['text'],
+      is_from_me: row['is_from_me'] == 1,
+      date: apple_to_iso(row['date']),
+      service: row['service'],
+      handle: row['handle_id'],
+      sender_name: row['is_from_me'] == 1 ? 'me' : (@handle_name_cache[row['handle_id']] || row['handle_id'])
+    }
+    msg[:has_attachments] = true if row['cache_has_attachments'] == 1
+    msg
+  end
+
+  success(
+    chat: {
+      chat_id: chat_id.to_i,
+      identifier: chat['chat_identifier'],
+      display_name: chat['display_name']&.empty? ? nil : chat['display_name'],
+      service: chat['service_name'],
+      is_group: chat['style'] == 43,
+      participants: participants.map do |p|
+        { handle: p['id'], name: @handle_name_cache[p['id']] }
+      end
+    },
+    messages: messages,
+    count: messages.length
+  )
+end
+
+def cmd_contacts(query)
+  error("Search query is required", 'USAGE') if query.nil? || query.strip.empty?
+  results = search_contacts_app(query)
+  success(contacts: results, count: results.length, query: query)
+end
+
+def cmd_aliases
+  aliases = load_aliases
+  if aliases.empty?
+    success(aliases: {}, count: 0, path: ALIASES_PATH, exists: File.exist?(ALIASES_PATH))
+  else
+    formatted = aliases.map do |key, value|
+      if value.is_a?(Hash)
+        { alias: key, phone: value['phone'], name: value['name'] }
+      else
+        { alias: key, phone: value.to_s, name: nil }
+      end
+    end
+    success(aliases: formatted, count: formatted.length, path: ALIASES_PATH)
+  end
+end
+
+# --------------------------------------------------------------------------
+# Main
+# --------------------------------------------------------------------------
+
+begin
+  command = ARGV.shift
+  options = {}
+
+  case command
+  when 'threads'
+    OptionParser.new do |opts|
+      opts.on('--limit N', Integer) { |v| options[:limit] = v }
+      opts.on('--since DATE') { |v| options[:since] = v }
+    end.parse!
+    cmd_threads(options)
+
+  when 'thread'
+    contact = ARGV.shift
+    error("Contact is required. Usage: imessages thread <contact> [--limit N]", 'USAGE') unless contact
+    OptionParser.new do |opts|
+      opts.on('--limit N', Integer) { |v| options[:limit] = v }
+      opts.on('--since DATE') { |v| options[:since] = v }
+    end.parse!
+    cmd_thread(contact, options)
+
+  when 'search'
+    query = ARGV.shift
+    error("Search query is required. Usage: imessages search <query> [--limit N] [--from CONTACT]", 'USAGE') unless query
+    OptionParser.new do |opts|
+      opts.on('--limit N', Integer) { |v| options[:limit] = v }
+      opts.on('--from CONTACT') { |v| options[:from] = v }
+    end.parse!
+    cmd_search(query, options)
+
+  when 'send'
+    contact = ARGV.shift
+    message = ARGV.shift
+    error("Usage: imessages send <contact> <message>", 'USAGE') unless contact && message
+    cmd_send(contact, message)
+
+  when 'send-group'
+    chat_id = ARGV.shift
+    message = ARGV.shift
+    error("Usage: imessages send-group <chat_id> <message>", 'USAGE') unless chat_id && message
+    cmd_send_group(chat_id, message)
+
+  when 'chats'
+    OptionParser.new do |opts|
+      opts.on('--limit N', Integer) { |v| options[:limit] = v }
+    end.parse!
+    cmd_chats(options)
+
+  when 'chat'
+    chat_id = ARGV.shift
+    error("Chat ID is required. Usage: imessages chat <chat_id> [--limit N]", 'USAGE') unless chat_id
+    OptionParser.new do |opts|
+      opts.on('--limit N', Integer) { |v| options[:limit] = v }
+      opts.on('--since DATE') { |v| options[:since] = v }
+    end.parse!
+    cmd_chat(chat_id, options)
+
+  when 'contacts'
+    query = ARGV.shift
+    error("Search query is required. Usage: imessages contacts <query>", 'USAGE') unless query
+    cmd_contacts(query)
+
+  when 'aliases'
+    cmd_aliases
+
+  when '-h', '--help', 'help', nil
+    puts <<~HELP
+      imessages - CLI for reading and sending iMessages
+
+      Usage:
+        imessages threads  [--limit 20] [--since DATE]      List conversation threads
+        imessages thread   <contact> [--limit 50]           Messages with a contact
+        imessages search   <query> [--limit 20] [--from C]  Search messages
+        imessages send     <contact> <message>              Send a message (1:1)
+        imessages send-group <chat_id> <message>            Send to a group chat
+        imessages chats    [--limit 20]                     List all chats (DMs + groups)
+        imessages chat     <chat_id> [--limit 50]           Messages in a chat
+        imessages contacts <query>                          Search Contacts.app
+        imessages aliases                                   Show configured aliases
+
+      Contact can be:
+        - Phone number: +18175551234
+        - Alias from aliases.yml: mom, dad
+        - Name to search in Contacts.app: "Justin Genco"
+
+      Output: JSON to stdout
+    HELP
+    exit 0
+
+  else
+    error("Unknown command: #{command}", 'USAGE',
+          'Commands: threads, thread, search, send, send-group, chats, chat, contacts, aliases')
+  end
+
+rescue => e
+  error(e.message, 'ERROR', e.backtrace&.first(3)&.join("\n"))
+end
