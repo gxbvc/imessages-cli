@@ -76,6 +76,55 @@ def date_to_apple_ns(date_str)
 end
 
 # --------------------------------------------------------------------------
+# attributedBody fallback
+# --------------------------------------------------------------------------
+
+def extract_attributed_body_text(blob)
+  return nil if blob.nil? || blob.empty?
+  # NSAttributedString binary blob: extract readable text
+  # Use binary encoding to safely scan, then extract ASCII/UTF-8 text
+  bytes = blob.dup.force_encoding('BINARY')
+  return nil unless bytes.include?('NSString'.encode('BINARY'))
+  
+  # Find text after NSString marker: the pattern is NSString + type byte + length prefix + text
+  # The text appears between NSString header bytes and NSDictionary
+  markers = %w[streamtyped NSAttributedString NSObject NSString NSDictionary NSNumber NSValue __kIMMessagePartAttributeName]
+  
+  # Extract readable ASCII segments (4+ chars between non-printable bytes)
+  segments = bytes.scan(/[\x20-\x7e]{4,}/)
+  segments = segments.map { |s| s.force_encoding('UTF-8') }
+  segments = segments.reject { |s| markers.include?(s) }
+  
+  # The actual message text is typically the longest segment, or we can join non-marker segments
+  # But we need to handle multi-part messages (rich text with inline objects)
+  # Strategy: take segments that appear after "NSString" in the blob
+  ns_string_pos = bytes.index('NSString'.encode('BINARY'))
+  return nil unless ns_string_pos
+  
+  after = bytes[ns_string_pos..]
+  text_segments = after.scan(/[\x20-\x7e]{2,}/)
+  text_segments = text_segments.map { |s| s.force_encoding('UTF-8') }
+  text_segments = text_segments.reject { |s| markers.include?(s) || s.start_with?('+') && s.length <= 3 }
+  
+  # The first text segment has a "+<length_byte>" prefix from NSArchiver encoding - strip it
+  if text_segments.first && text_segments.first.start_with?('+')
+    text_segments[0] = text_segments.first[2..]
+  end
+  
+  # "iI" is a trailing NSArchiver marker
+  text_segments = text_segments.reject { |s| s == 'iI' || s == 'iM' }
+  
+  result = text_segments.join('')
+  return result.empty? ? nil : result
+rescue
+  nil
+end
+
+def message_text(row)
+  row['text'] || extract_attributed_body_text(row['attributedBody'])
+end
+
+# --------------------------------------------------------------------------
 # Database
 # --------------------------------------------------------------------------
 
@@ -305,7 +354,7 @@ def cmd_threads(options)
   # Get last message text for each chat
   threads = rows.map do |row|
     last_msg = db.execute(<<~SQL, [row['chat_id']]).first
-      SELECT m.text, m.is_from_me, m.date
+      SELECT m.text, m.attributedBody, m.is_from_me, m.date
       FROM message m
       JOIN chat_message_join cmj ON cmj.message_id = m.ROWID
       WHERE cmj.chat_id = ?
@@ -322,7 +371,7 @@ def cmd_threads(options)
       message_count: row['message_count'],
       last_message_date: apple_to_iso(row['last_date']),
       last_message: last_msg ? {
-        text: last_msg['text'],
+        text: message_text(last_msg),
         is_from_me: last_msg['is_from_me'] == 1,
         date: apple_to_iso(last_msg['date'])
       } : nil
@@ -367,6 +416,7 @@ def cmd_thread(contact_input, options)
       m.ROWID,
       m.guid,
       m.text,
+      m.attributedBody,
       m.is_from_me,
       m.date,
       m.date_read,
@@ -387,7 +437,7 @@ def cmd_thread(contact_input, options)
     msg = {
       id: row['ROWID'],
       guid: row['guid'],
-      text: row['text'],
+      text: message_text(row),
       is_from_me: row['is_from_me'] == 1,
       date: apple_to_iso(row['date']),
       service: row['service'],
@@ -430,8 +480,8 @@ end
 def cmd_search(query, options)
   db = open_db
   limit = options[:limit] || 20
-  conditions = ["m.text LIKE ?"]
-  params = ["%#{query}%"]
+  conditions = ["(m.text LIKE ? OR m.attributedBody LIKE ?)"]
+  params = ["%#{query}%", "%#{query}%"]
 
   if options[:from]
     resolved = resolve_contact(options[:from])
@@ -448,6 +498,7 @@ def cmd_search(query, options)
     SELECT
       m.ROWID,
       m.text,
+      m.attributedBody,
       m.is_from_me,
       m.date,
       m.service,
@@ -471,7 +522,7 @@ def cmd_search(query, options)
   messages = rows.map do |row|
     {
       id: row['ROWID'],
-      text: row['text'],
+      text: message_text(row),
       is_from_me: row['is_from_me'] == 1,
       date: apple_to_iso(row['date']),
       service: row['service'],
@@ -486,67 +537,113 @@ def cmd_search(query, options)
   success(messages: messages, count: messages.length, query: query)
 end
 
-def cmd_send(contact_input, message_text)
-  error("Message text is required", 'USAGE') if message_text.nil? || message_text.strip.empty?
+def send_via_applescript(phone, text: nil, files: [], sms: false)
+  escaped_phone = phone.gsub('"', '\\"')
+
+  send_lines = []
+  if text && !text.strip.empty?
+    escaped_message = text.gsub('\\', '\\\\\\\\').gsub('"', '\\"')
+    send_lines << %Q{send "#{escaped_message}" to targetBuddy}
+  end
+  files.each do |f|
+    escaped_path = f.gsub('\\', '\\\\\\\\').gsub('"', '\\"')
+    send_lines << %Q{send POSIX file "#{escaped_path}" to targetBuddy}
+  end
+
+  unless sms
+    script = <<~APPLESCRIPT
+      tell application "Messages"
+        set targetService to 1st account whose service type = iMessage
+        set targetBuddy to participant "#{escaped_phone}" of targetService
+        #{send_lines.join("\n      ")}
+      end tell
+    APPLESCRIPT
+
+    stdout, stderr, status = Open3.capture3('osascript', '-e', script)
+    return true if status.success?
+  end
+
+  # Try SMS service (as fallback, or directly if --sms flag)
+  sms_script = <<~APPLESCRIPT
+    tell application "Messages"
+      set targetService to 1st account whose service type = SMS
+      set targetBuddy to participant "#{escaped_phone}" of targetService
+      #{send_lines.join("\n      ")}
+    end tell
+  APPLESCRIPT
+
+  stdout2, stderr2, status2 = Open3.capture3('osascript', '-e', sms_script)
+  unless status2.success?
+    imessage_err = sms ? "" : "#{(stderr || '').strip} / "
+    error("Failed to send message: #{imessage_err}#{(stderr2 || '').strip}", 'SEND_FAILED')
+  end
+  true
+end
+
+def cmd_send(contact_input, message_text, options = {})
+  files = options[:files] || []
+
+  # Validate: need at least text or a file
+  has_text = message_text && !message_text.strip.empty?
+  error("Message text or --file is required", 'USAGE') if !has_text && files.empty?
+
+  # Validate files exist
+  files.each do |f|
+    error("File not found: #{f}", 'FILE_NOT_FOUND') unless File.exist?(f)
+    error("File not readable: #{f}", 'FILE_NOT_READABLE') unless File.readable?(f)
+  end
 
   resolved = resolve_contact(contact_input)
   phone = resolved[:phone]
 
-  # Escape for AppleScript
-  escaped_message = message_text.gsub('\\', '\\\\\\\\').gsub('"', '\\"')
-  escaped_phone = phone.gsub('"', '\\"')
+  send_via_applescript(phone, text: has_text ? message_text : nil, files: files, sms: options[:sms])
 
-  script = <<~APPLESCRIPT
-    tell application "Messages"
-      set targetService to 1st account whose service type = iMessage
-      set targetBuddy to participant "#{escaped_phone}" of targetService
-      send "#{escaped_message}" to targetBuddy
-    end tell
-  APPLESCRIPT
-
-  stdout, stderr, status = Open3.capture3('osascript', '-e', script)
-  unless status.success?
-    # Try SMS service as fallback
-    sms_script = <<~APPLESCRIPT
-      tell application "Messages"
-        set targetService to 1st account whose service type = SMS
-        set targetBuddy to participant "#{escaped_phone}" of targetService
-        send "#{escaped_message}" to targetBuddy
-      end tell
-    APPLESCRIPT
-
-    stdout2, stderr2, status2 = Open3.capture3('osascript', '-e', sms_script)
-    unless status2.success?
-      error("Failed to send message: #{stderr.strip} / #{stderr2.strip}", 'SEND_FAILED')
-    end
-  end
-
-  success(
+  result = {
     sent: true,
     to: {
       phone: phone,
       name: resolved[:name],
       source: resolved[:source]
     },
-    message: message_text
-  )
+  }
+  result[:message] = message_text if has_text
+  result[:attachments] = files.map { |f| File.basename(f) } unless files.empty?
+
+  success(result)
 end
 
-def cmd_send_group(chat_id, message_text)
-  error("Message text is required", 'USAGE') if message_text.nil? || message_text.strip.empty?
+def cmd_send_group(chat_id, message_text, options = {})
+  files = options[:files] || []
+  has_text = message_text && !message_text.strip.empty?
+  error("Message text or --file is required", 'USAGE') if !has_text && files.empty?
+
+  # Validate files exist
+  files.each do |f|
+    error("File not found: #{f}", 'FILE_NOT_FOUND') unless File.exist?(f)
+    error("File not readable: #{f}", 'FILE_NOT_READABLE') unless File.readable?(f)
+  end
 
   db = open_db
   chat = db.execute("SELECT ROWID, chat_identifier, display_name, service_name FROM chat WHERE ROWID = ?", [chat_id.to_i]).first
   error("Chat #{chat_id} not found", 'NOT_FOUND') unless chat
 
-  escaped_message = message_text.gsub('\\', '\\\\\\\\').gsub('"', '\\"')
   chat_identifier = chat['chat_identifier'].gsub('"', '\\"')
   service = chat['service_name'] || 'iMessage'
+
+  send_lines = []
+  if has_text
+    escaped_message = message_text.gsub('\\', '\\\\\\\\').gsub('"', '\\"')
+    send_lines << %Q{send "#{escaped_message}" to targetChat}
+  end
+  files.each do |f|
+    escaped_path = f.gsub('\\', '\\\\\\\\').gsub('"', '\\"')
+    send_lines << %Q{send POSIX file "#{escaped_path}" to targetChat}
+  end
 
   script = <<~APPLESCRIPT
     tell application "Messages"
       set targetChat to chat id "#{service};+;#{chat_identifier}"
-      send "#{escaped_message}" to targetChat
+      #{send_lines.join("\n      ")}
     end tell
   APPLESCRIPT
 
@@ -554,13 +651,12 @@ def cmd_send_group(chat_id, message_text)
 
   # If that didn't work, try finding the chat by iterating
   unless status.success?
-    # Try with the raw chat guid from the DB
     chat_guid = chat['chat_identifier']
     script2 = <<~APPLESCRIPT
       tell application "Messages"
         repeat with aChat in every chat
           if id of aChat contains "#{chat_guid.gsub('"', '\\"')}" then
-            send "#{escaped_message}" to aChat
+            #{send_lines.map { |l| l.gsub('targetChat', 'aChat') }.join("\n            ")}
             return "sent"
           end if
         end repeat
@@ -574,12 +670,15 @@ def cmd_send_group(chat_id, message_text)
     end
   end
 
-  success(
+  result = {
     sent: true,
     chat_id: chat_id.to_i,
     chat_name: chat['display_name']&.empty? ? nil : chat['display_name'],
-    message: message_text
-  )
+  }
+  result[:message] = message_text if has_text
+  result[:attachments] = files.map { |f| File.basename(f) } unless files.empty?
+
+  success(result)
 end
 
 def cmd_chats(options)
@@ -660,6 +759,7 @@ def cmd_chat(chat_id, options)
       m.ROWID,
       m.guid,
       m.text,
+      m.attributedBody,
       m.is_from_me,
       m.date,
       m.service,
@@ -676,7 +776,7 @@ def cmd_chat(chat_id, options)
   messages = rows.reverse.map do |row|
     msg = {
       id: row['ROWID'],
-      text: row['text'],
+      text: message_text(row),
       is_from_me: row['is_from_me'] == 1,
       date: apple_to_iso(row['date']),
       service: row['service'],
@@ -761,15 +861,32 @@ begin
 
   when 'send'
     contact = ARGV.shift
-    message = ARGV.shift
-    error("Usage: imessages send <contact> <message>", 'USAGE') unless contact && message
-    cmd_send(contact, message)
+    error("Usage: imessages send <contact> [message] [--file PATH] [--sms] [--stdin]", 'USAGE') unless contact
+    options[:files] = []
+    options[:stdin] = false
+    OptionParser.new do |opts|
+      opts.on('--file PATH', '--attachment PATH') { |v| options[:files] << v }
+      opts.on('--sms', 'Send as SMS/RCS instead of iMessage') { options[:sms] = true }
+      opts.on('--stdin', 'Read message text from stdin') { options[:stdin] = true }
+    end.parse!
+    if options[:stdin]
+      message = $stdin.read
+    else
+      message = ARGV.shift
+    end
+    error("Usage: imessages send <contact> <message> or --file PATH or --stdin", 'USAGE') if (message.nil? || message.strip.empty?) && options[:files].empty?
+    cmd_send(contact, message, options)
 
   when 'send-group'
     chat_id = ARGV.shift
+    error("Usage: imessages send-group <chat_id> [message] [--file PATH]", 'USAGE') unless chat_id
+    options[:files] = []
+    OptionParser.new do |opts|
+      opts.on('--file PATH', '--attachment PATH') { |v| options[:files] << v }
+    end.parse!
     message = ARGV.shift
-    error("Usage: imessages send-group <chat_id> <message>", 'USAGE') unless chat_id && message
-    cmd_send_group(chat_id, message)
+    error("Usage: imessages send-group <chat_id> <message> or --file PATH", 'USAGE') if (message.nil? || message.strip.empty?) && options[:files].empty?
+    cmd_send_group(chat_id, message, options)
 
   when 'chats'
     OptionParser.new do |opts|
@@ -802,8 +919,8 @@ begin
         imessages threads  [--limit 20] [--since DATE]      List conversation threads
         imessages thread   <contact> [--limit 50]           Messages with a contact
         imessages search   <query> [--limit 20] [--from C]  Search messages
-        imessages send     <contact> <message>              Send a message (1:1)
-        imessages send-group <chat_id> <message>            Send to a group chat
+        imessages send     <contact> [message] [--file P] [--stdin]  Send message/file (1:1)
+        imessages send-group <chat_id> [msg] [--file P]     Send message/file to group
         imessages chats    [--limit 20]                     List all chats (DMs + groups)
         imessages chat     <chat_id> [--limit 50]           Messages in a chat
         imessages contacts <query>                          Search Contacts.app
