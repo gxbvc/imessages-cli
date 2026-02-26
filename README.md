@@ -50,6 +50,15 @@ imessages search "dinner" --from "ricky"   # Filter by sender
 imessages send "+18175551234" "Hello!"     # By phone number
 imessages send "Justin Genco" "Hey!"       # By contact name
 imessages send "ricky" "What's up?"        # By alias
+imessages send "ricky" --sms "Hey!"        # Send as SMS/RCS (for Android contacts)
+```
+
+#### Sending messages with dollar signs or special characters
+
+Use `--stdin` to pipe the message via stdin. This avoids bash shell expansion which eats `$` signs (e.g., `$23` becomes `3`):
+
+```bash
+echo 'Party packages start at $219' | imessages send "+18175551234" --stdin
 ```
 
 Note: Messages.app will briefly activate when sending.
