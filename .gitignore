@@ -1,1 +1,3 @@
 aliases.yml
+.env
+.DS_Store

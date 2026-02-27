@@ -41,3 +41,4 @@ Threads include `contact_name` resolved from Contacts.app. Group chats include `
 - **Group chat IDs**: get these from `imessages chats`; use with `chat` and `send-group`
 - **Attachments**: message objects include `attachments` array with filename, mime_type, bytes when present
 - **Dollar signs in messages**: bash eats `$` in double-quoted args (e.g., `"$23"` → `"3"`). Use `--stdin` to pipe the message: `echo 'Costs $23' | imessages send <contact> --stdin`
+- **VCF attachments don't send**: AppleScript-based sending fails silently for `.vcf` (vCard) files — the message shows "(!)" in Messages.app. Drag-and-drop in the Messages UI works fine. This may affect other non-media file types too.

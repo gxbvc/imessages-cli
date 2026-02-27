@@ -260,43 +260,120 @@ def build_handle_map(db)
   handles
 end
 
+# Build a normalized phone→name map from the AddressBook SQLite databases.
+# This is much faster and more reliable than AppleScript lookups, which fail
+# due to phone number formatting mismatches (e.g., "+1 469-664-7850" vs "+14696647850").
+def build_contacts_phone_map
+  return @contacts_phone_map if @contacts_phone_map
+
+  @contacts_phone_map = {}
+  ab_dir = File.expand_path("~/Library/Application Support/AddressBook")
+
+  # Collect all AddressBook database paths (main + sources)
+  db_paths = Dir.glob(File.join(ab_dir, "**", "AddressBook-v22.abcddb"))
+
+  db_paths.each do |db_path|
+    begin
+      ab_db = SQLite3::Database.new(db_path, results_as_hash: true, readonly: true)
+      rows = ab_db.execute(<<~SQL)
+        SELECT
+          COALESCE(r.ZFIRSTNAME, '') || ' ' || COALESCE(r.ZLASTNAME, '') as full_name,
+          p.ZFULLNUMBER as phone
+        FROM ZABCDRECORD r
+        JOIN ZABCDPHONENUMBER p ON p.ZOWNER = r.Z_PK
+        WHERE p.ZFULLNUMBER IS NOT NULL
+          AND (r.ZFIRSTNAME IS NOT NULL OR r.ZLASTNAME IS NOT NULL)
+      SQL
+      rows.each do |row|
+        name = row['full_name']&.strip
+        next if name.nil? || name.empty?
+        normalized = normalize_phone(row['phone'])
+        # First entry wins (don't overwrite)
+        @contacts_phone_map[normalized] ||= name
+      end
+      ab_db.close
+    rescue => e
+      # Skip unreadable databases
+    end
+  end
+
+  @contacts_phone_map
+end
+
+# Build a normalized email→name map from the AddressBook SQLite databases.
+def build_contacts_email_map
+  return @contacts_email_map if @contacts_email_map
+
+  @contacts_email_map = {}
+  ab_dir = File.expand_path("~/Library/Application Support/AddressBook")
+  db_paths = Dir.glob(File.join(ab_dir, "**", "AddressBook-v22.abcddb"))
+
+  db_paths.each do |db_path|
+    begin
+      ab_db = SQLite3::Database.new(db_path, results_as_hash: true, readonly: true)
+      # Check if email table exists
+      tables = ab_db.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='ZABCDEMAILADDRESS'")
+      next if tables.empty?
+      rows = ab_db.execute(<<~SQL)
+        SELECT
+          COALESCE(r.ZFIRSTNAME, '') || ' ' || COALESCE(r.ZLASTNAME, '') as full_name,
+          e.ZADDRESS as email
+        FROM ZABCDRECORD r
+        JOIN ZABCDEMAILADDRESS e ON e.ZOWNER = r.Z_PK
+        WHERE e.ZADDRESS IS NOT NULL
+          AND (r.ZFIRSTNAME IS NOT NULL OR r.ZLASTNAME IS NOT NULL)
+      SQL
+      rows.each do |row|
+        name = row['full_name']&.strip
+        next if name.nil? || name.empty?
+        email = row['email']&.strip&.downcase
+        next if email.nil? || email.empty?
+        @contacts_email_map[email] ||= name
+      end
+      ab_db.close
+    rescue => e
+      # Skip unreadable databases
+    end
+  end
+
+  @contacts_email_map
+end
+
 def resolve_handle_name(handle_id_str)
-  # Try to find a name in Contacts.app for a phone/email
   return nil if handle_id_str.nil? || handle_id_str.empty?
 
-  # Cache results in a class variable equivalent
   @handle_name_cache ||= {}
   return @handle_name_cache[handle_id_str] if @handle_name_cache.key?(handle_id_str)
 
-  script = <<~APPLESCRIPT
-    tell application "Contacts"
-      set matchedPeople to (every person whose value of every phone contains "#{handle_id_str.gsub('"', '\\"')}")
-      if (count of matchedPeople) > 0 then
-        return name of (item 1 of matchedPeople)
-      end if
-      set matchedPeople to (every person whose value of every email contains "#{handle_id_str.gsub('"', '\\"')}")
-      if (count of matchedPeople) > 0 then
-        return name of (item 1 of matchedPeople)
-      end if
-      return ""
-    end tell
-  APPLESCRIPT
+  name = nil
+  if looks_like_phone?(handle_id_str)
+    phone_map = build_contacts_phone_map
+    normalized = normalize_phone(handle_id_str)
+    name = phone_map[normalized]
+  else
+    # Likely an email handle
+    email_map = build_contacts_email_map
+    name = email_map[handle_id_str.downcase]
+  end
 
-  stdout, _, status = Open3.capture3('osascript', '-e', script)
-  name = status.success? ? stdout.strip : nil
-  name = nil if name == ""
   @handle_name_cache[handle_id_str] = name
   name
 end
 
-# Batch resolve names for a set of handle IDs to avoid N+1 AppleScript calls.
-# Returns { handle_id_string => "Contact Name" or nil }
+# Batch resolve names for a set of handle IDs.
+# Pre-populates the cache, then returns { handle_id_string => "Contact Name" or nil }
 def batch_resolve_names(handle_ids)
   @handle_name_cache ||= {}
   to_resolve = handle_ids.uniq.reject { |id| @handle_name_cache.key?(id) }
 
-  to_resolve.each do |hid|
-    resolve_handle_name(hid)
+  # Pre-load contact maps once, then resolve all at once
+  unless to_resolve.empty?
+    has_phones = to_resolve.any? { |id| looks_like_phone?(id) }
+    has_emails = to_resolve.any? { |id| !looks_like_phone?(id) }
+    build_contacts_phone_map if has_phones
+    build_contacts_email_map if has_emails
+
+    to_resolve.each { |hid| resolve_handle_name(hid) }
   end
 
   handle_ids.each_with_object({}) do |hid, map|
@@ -833,8 +910,18 @@ begin
   command = ARGV.shift
   options = {}
 
+  # Check for --help in ARGV before parsing (so subcommands handle it instead of treating it as an argument)
+  show_subcmd_help = ARGV.include?('--help') || ARGV.include?('-h')
+
   case command
   when 'threads'
+    if show_subcmd_help
+      puts "Usage: imessages threads [--limit N] [--since DATE]"
+      puts "  List 1:1 conversation threads sorted by recency"
+      puts "  --limit N      Max threads to return (default: 20)"
+      puts "  --since DATE   Only include threads with messages after DATE"
+      exit 0
+    end
     OptionParser.new do |opts|
       opts.on('--limit N', Integer) { |v| options[:limit] = v }
       opts.on('--since DATE') { |v| options[:since] = v }
@@ -842,6 +929,13 @@ begin
     cmd_threads(options)
 
   when 'thread'
+    if show_subcmd_help
+      puts "Usage: imessages thread <contact> [--limit N] [--since DATE]"
+      puts "  Show message history with a contact"
+      puts "  --limit N      Max messages to return (default: 50)"
+      puts "  --since DATE   Only include messages after DATE"
+      exit 0
+    end
     contact = ARGV.shift
     error("Contact is required. Usage: imessages thread <contact> [--limit N]", 'USAGE') unless contact
     OptionParser.new do |opts|
@@ -851,6 +945,13 @@ begin
     cmd_thread(contact, options)
 
   when 'search'
+    if show_subcmd_help
+      puts "Usage: imessages search <query> [--limit N] [--from CONTACT]"
+      puts "  Full-text search across messages"
+      puts "  --limit N        Max results to return (default: 20)"
+      puts "  --from CONTACT   Filter by sender contact"
+      exit 0
+    end
     query = ARGV.shift
     error("Search query is required. Usage: imessages search <query> [--limit N] [--from CONTACT]", 'USAGE') unless query
     OptionParser.new do |opts|
@@ -860,6 +961,14 @@ begin
     cmd_search(query, options)
 
   when 'send'
+    if show_subcmd_help
+      puts "Usage: imessages send <contact> [message] [--file PATH] [--sms] [--stdin]"
+      puts "  Send a message to a contact"
+      puts "  --file PATH    Attach a file (can be repeated)"
+      puts "  --sms          Send as SMS/RCS instead of iMessage"
+      puts "  --stdin        Read message text from stdin"
+      exit 0
+    end
     contact = ARGV.shift
     error("Usage: imessages send <contact> [message] [--file PATH] [--sms] [--stdin]", 'USAGE') unless contact
     options[:files] = []
@@ -878,6 +987,12 @@ begin
     cmd_send(contact, message, options)
 
   when 'send-group'
+    if show_subcmd_help
+      puts "Usage: imessages send-group <chat_id> [message] [--file PATH]"
+      puts "  Send a message to a group chat"
+      puts "  --file PATH    Attach a file (can be repeated)"
+      exit 0
+    end
     chat_id = ARGV.shift
     error("Usage: imessages send-group <chat_id> [message] [--file PATH]", 'USAGE') unless chat_id
     options[:files] = []
@@ -889,12 +1004,25 @@ begin
     cmd_send_group(chat_id, message, options)
 
   when 'chats'
+    if show_subcmd_help
+      puts "Usage: imessages chats [--limit N]"
+      puts "  List all chats (DMs + groups) sorted by recency"
+      puts "  --limit N      Max chats to return (default: 20)"
+      exit 0
+    end
     OptionParser.new do |opts|
       opts.on('--limit N', Integer) { |v| options[:limit] = v }
     end.parse!
     cmd_chats(options)
 
   when 'chat'
+    if show_subcmd_help
+      puts "Usage: imessages chat <chat_id> [--limit N] [--since DATE]"
+      puts "  Show messages in a specific chat"
+      puts "  --limit N      Max messages to return (default: 50)"
+      puts "  --since DATE   Only include messages after DATE"
+      exit 0
+    end
     chat_id = ARGV.shift
     error("Chat ID is required. Usage: imessages chat <chat_id> [--limit N]", 'USAGE') unless chat_id
     OptionParser.new do |opts|
@@ -904,11 +1032,21 @@ begin
     cmd_chat(chat_id, options)
 
   when 'contacts'
+    if show_subcmd_help
+      puts "Usage: imessages contacts <query>"
+      puts "  Search Contacts.app by name"
+      exit 0
+    end
     query = ARGV.shift
     error("Search query is required. Usage: imessages contacts <query>", 'USAGE') unless query
     cmd_contacts(query)
 
   when 'aliases'
+    if show_subcmd_help
+      puts "Usage: imessages aliases"
+      puts "  Show configured aliases from aliases.yml"
+      exit 0
+    end
     cmd_aliases
 
   when '-h', '--help', 'help', nil
