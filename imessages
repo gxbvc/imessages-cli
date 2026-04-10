@@ -262,7 +262,7 @@ end
 
 # Build a normalized phone→name map from the AddressBook SQLite databases.
 # This is much faster and more reliable than AppleScript lookups, which fail
-# due to phone number formatting mismatches (e.g., "+1 469-664-7850" vs "+14696647850").
+# due to phone number formatting mismatches (e.g., "+1 555-123-4567" vs "+15551234567").
 def build_contacts_phone_map
   return @contacts_phone_map if @contacts_phone_map
 
@@ -1065,9 +1065,9 @@ begin
         imessages aliases                                   Show configured aliases
 
       Contact can be:
-        - Phone number: +18175551234
+        - Phone number: +15551234567
         - Alias from aliases.yml: mom, dad
-        - Name to search in Contacts.app: "Justin Genco"
+        - Name to search in Contacts.app: "Jane Doe"
 
       Output: JSON to stdout
     HELP

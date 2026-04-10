@@ -18,7 +18,7 @@ macOS Messages.app supports sending files via AppleScript using `POSIX file`:
 ```applescript
 tell application "Messages"
   set targetService to 1st account whose service type = iMessage
-  set targetBuddy to participant "+18176685828" of targetService
+  set targetBuddy to participant "+15551234567" of targetService
   send POSIX file "/path/to/image.png" to targetBuddy
 end tell
 ```
@@ -70,13 +70,13 @@ Add `--file` to usage examples and document the new capability.
 
 ```bash
 # Text + image
-imessages send "+18176685828" "Here's a screenshot" --file /tmp/screenshot.png
+imessages send "+15551234567" "Here's a screenshot" --file /tmp/screenshot.png
 
 # Image only
-imessages send "+18176685828" --file /tmp/photo.jpg
+imessages send "+15551234567" --file /tmp/photo.jpg
 
 # Multiple files
-imessages send "+18176685828" "Two files" --file /tmp/a.png --file /tmp/b.png
+imessages send "+15551234567" "Two files" --file /tmp/a.png --file /tmp/b.png
 
 # Group
 imessages send-group 42 "Meeting notes" --file /tmp/notes.pdf

@@ -29,11 +29,11 @@ imessages threads --since "2025-01-01"     # Only threads with messages after da
 ### View messages with a contact
 
 ```bash
-imessages thread "+18175551234"            # By phone number
-imessages thread "Justin Genco"            # By contact name (Contacts.app lookup)
-imessages thread "ricky"                   # By alias (from aliases.yml)
-imessages thread "ricky" --limit 100       # More messages
-imessages thread "ricky" --since "2025-06-01"
+imessages thread "+15551234567"            # By phone number
+imessages thread "Jane Doe"                # By contact name (Contacts.app lookup)
+imessages thread "jane"                    # By alias (from aliases.yml)
+imessages thread "jane" --limit 100        # More messages
+imessages thread "jane" --since "2025-06-01"
 ```
 
 ### Search messages
@@ -41,16 +41,16 @@ imessages thread "ricky" --since "2025-06-01"
 ```bash
 imessages search "dinner"                  # Search all messages
 imessages search "dinner" --limit 10       # Limit results
-imessages search "dinner" --from "ricky"   # Filter by sender
+imessages search "dinner" --from "jane"    # Filter by sender
 ```
 
 ### Send a message
 
 ```bash
-imessages send "+18175551234" "Hello!"     # By phone number
-imessages send "Justin Genco" "Hey!"       # By contact name
-imessages send "ricky" "What's up?"        # By alias
-imessages send "ricky" --sms "Hey!"        # Send as SMS/RCS (for Android contacts)
+imessages send "+15551234567" "Hello!"     # By phone number
+imessages send "Jane Doe" "Hey!"           # By contact name
+imessages send "jane" "What's up?"         # By alias
+imessages send "jane" --sms "Hey!"         # Send as SMS/RCS (for Android contacts)
 ```
 
 #### Sending messages with dollar signs or special characters
@@ -58,7 +58,7 @@ imessages send "ricky" --sms "Hey!"        # Send as SMS/RCS (for Android contac
 Use `--stdin` to pipe the message via stdin. This avoids bash shell expansion which eats `$` signs (e.g., `$23` becomes `3`):
 
 ```bash
-echo 'Party packages start at $219' | imessages send "+18175551234" --stdin
+echo 'Party packages start at $219' | imessages send "+15551234567" --stdin
 ```
 
 Note: Messages.app will briefly activate when sending.
@@ -74,7 +74,7 @@ imessages send-group 1054 "Hello everyone" # Send to a group chat
 ### Contact lookup
 
 ```bash
-imessages contacts "Justin"                # Search Contacts.app
+imessages contacts "Jane"                  # Search Contacts.app
 imessages aliases                          # Show configured aliases
 ```
 
@@ -84,15 +84,15 @@ Create `aliases.yml` in the tool directory for quick contact shortcuts:
 
 ```yaml
 # Simple format
-mom: "+18175551234"
+mom: "+15551234567"
 
 # Detailed format
-justin:
-  phone: "+16823012552"
-  name: "Justin Genco"
+jane:
+  phone: "+15551234567"
+  name: "Jane Doe"
 ```
 
-Aliases are checked before Contacts.app, so they also serve as disambiguation (e.g., "ricky" → Ricky Bureau, not Ricky Mouser).
+Aliases are checked before Contacts.app, so they also serve as disambiguation (e.g., "jane" → Jane Doe, not Jane Smith).
 
 The `aliases.yml` file is gitignored since it contains personal information.
 
