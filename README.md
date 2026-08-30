@@ -69,6 +69,7 @@ Note: Messages.app will briefly activate when sending.
 imessages chats --limit 10                 # List all chats (DMs + groups)
 imessages chat 1054 --limit 20             # View messages in a specific chat
 imessages send-group 1054 "Hello everyone" # Send to a group chat
+echo 'Costs $23' | imessages send-group 1054 --stdin  # Pipe message from stdin
 ```
 
 ### Contact lookup

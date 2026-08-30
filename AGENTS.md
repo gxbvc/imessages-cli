@@ -18,6 +18,7 @@ imessages-cli send <contact> "hi" --file a.png --file b.jpg  # Multiple attachme
 echo 'Costs $23' | imessages-cli send <contact> --stdin  # Pipe message from stdin (use for $ signs or special chars)
 imessages-cli send-group <chat_id> "message"              # Send to a group chat
 imessages-cli send-group <chat_id> --file /path/to/doc.pdf  # Attachment to group
+echo 'Costs $23' | imessages-cli send-group <chat_id> --stdin  # Pipe message from stdin
 imessages-cli chats [--limit 20]                          # List all chats (DMs + groups)
 imessages-cli chat <chat_id> [--limit 50] [--since D]     # Messages in a specific chat
 imessages-cli contacts <query>                             # Search Contacts.app by name

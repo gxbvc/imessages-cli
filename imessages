@@ -45,6 +45,10 @@ def output(data)
   puts JSON.generate(data)
 end
 
+def read_message_arg(options)
+  options[:stdin] ? $stdin.read : ARGV.shift
+end
+
 def success(data)
   output(ok: true, data: data)
   exit 0
@@ -614,6 +618,16 @@ def cmd_search(query, options)
   success(messages: messages, count: messages.length, query: query)
 end
 
+# Apple Events to Messages.app can report a nonzero osascript exit (AppleEvent
+# timeout -1712, dropped connection -609) *after* the send command has already
+# been dispatched and delivered. Treat those specific codes as success instead
+# of a false failure — otherwise callers retry and duplicate-send.
+BENIGN_SEND_ERROR_CODES = ['-1712', '-609'].freeze
+
+def benign_send_error?(stderr)
+  BENIGN_SEND_ERROR_CODES.any? { |code| stderr.to_s.include?("(#{code})") }
+end
+
 def send_via_applescript(phone, text: nil, files: [], sms: false)
   escaped_phone = phone.gsub('"', '\\"')
 
@@ -627,34 +641,19 @@ def send_via_applescript(phone, text: nil, files: [], sms: false)
     send_lines << %Q{send POSIX file "#{escaped_path}" to targetBuddy}
   end
 
-  unless sms
-    script = <<~APPLESCRIPT
-      tell application "Messages"
-        set targetService to 1st account whose service type = iMessage
-        set targetBuddy to participant "#{escaped_phone}" of targetService
-        #{send_lines.join("\n      ")}
-      end tell
-    APPLESCRIPT
-
-    stdout, stderr, status = Open3.capture3('osascript', '-e', script)
-    return true if status.success?
-  end
-
-  # Try SMS service (as fallback, or directly if --sms flag)
-  sms_script = <<~APPLESCRIPT
+  service_type = sms ? 'SMS' : 'iMessage'
+  script = <<~APPLESCRIPT
     tell application "Messages"
-      set targetService to 1st account whose service type = SMS
+      set targetService to 1st account whose service type = #{service_type}
       set targetBuddy to participant "#{escaped_phone}" of targetService
       #{send_lines.join("\n      ")}
     end tell
   APPLESCRIPT
 
-  stdout2, stderr2, status2 = Open3.capture3('osascript', '-e', sms_script)
-  unless status2.success?
-    imessage_err = sms ? "" : "#{(stderr || '').strip} / "
-    error("Failed to send message: #{imessage_err}#{(stderr2 || '').strip}", 'SEND_FAILED')
-  end
-  true
+  stdout, stderr, status = Open3.capture3('osascript', '-e', script)
+  return true if status.success? || benign_send_error?(stderr)
+
+  error("Failed to send message: #{stderr.strip}", 'SEND_FAILED')
 end
 
 def cmd_send(contact_input, message_text, options = {})
@@ -978,29 +977,28 @@ begin
       opts.on('--sms', 'Send as SMS/RCS instead of iMessage') { options[:sms] = true }
       opts.on('--stdin', 'Read message text from stdin') { options[:stdin] = true }
     end.parse!
-    if options[:stdin]
-      message = $stdin.read
-    else
-      message = ARGV.shift
-    end
+    message = read_message_arg(options)
     error("Usage: imessages send <contact> <message> or --file PATH or --stdin", 'USAGE') if (message.nil? || message.strip.empty?) && options[:files].empty?
     cmd_send(contact, message, options)
 
   when 'send-group'
     if show_subcmd_help
-      puts "Usage: imessages send-group <chat_id> [message] [--file PATH]"
+      puts "Usage: imessages send-group <chat_id> [message] [--file PATH] [--stdin]"
       puts "  Send a message to a group chat"
       puts "  --file PATH    Attach a file (can be repeated)"
+      puts "  --stdin        Read message text from stdin"
       exit 0
     end
     chat_id = ARGV.shift
-    error("Usage: imessages send-group <chat_id> [message] [--file PATH]", 'USAGE') unless chat_id
+    error("Usage: imessages send-group <chat_id> [message] [--file PATH] [--stdin]", 'USAGE') unless chat_id
     options[:files] = []
+    options[:stdin] = false
     OptionParser.new do |opts|
       opts.on('--file PATH', '--attachment PATH') { |v| options[:files] << v }
+      opts.on('--stdin', 'Read message text from stdin') { options[:stdin] = true }
     end.parse!
-    message = ARGV.shift
-    error("Usage: imessages send-group <chat_id> <message> or --file PATH", 'USAGE') if (message.nil? || message.strip.empty?) && options[:files].empty?
+    message = read_message_arg(options)
+    error("Usage: imessages send-group <chat_id> <message> or --file PATH or --stdin", 'USAGE') if (message.nil? || message.strip.empty?) && options[:files].empty?
     cmd_send_group(chat_id, message, options)
 
   when 'chats'
@@ -1058,7 +1056,7 @@ begin
         imessages thread   <contact> [--limit 50]           Messages with a contact
         imessages search   <query> [--limit 20] [--from C]  Search messages
         imessages send     <contact> [message] [--file P] [--stdin]  Send message/file (1:1)
-        imessages send-group <chat_id> [msg] [--file P]     Send message/file to group
+        imessages send-group <chat_id> [msg] [--file P] [--stdin]  Send message/file to group
         imessages chats    [--limit 20]                     List all chats (DMs + groups)
         imessages chat     <chat_id> [--limit 50]           Messages in a chat
         imessages contacts <query>                          Search Contacts.app
