@@ -63,6 +63,16 @@ echo 'Party packages start at $219' | imessages send "+15551234567" --stdin
 
 Note: Messages.app will briefly activate when sending.
 
+### Send files (iMessage, SMS/MMS, group)
+
+```bash
+imessages send "+15551234567" --file /tmp/photo.jpg            # iMessage
+imessages send "+15551234567" "Caption" --sms --file /tmp/a.jpg # MMS (caption is a separate SMS)
+imessages send-group 1054 --file /tmp/notes.pdf
+```
+
+Messages cannot read files outside its sandbox (for example `/tmp` or `~/projects`), so the CLI first copies each file to `~/Library/Messages/Attachments/imessages-cli/<uuid>/`. Messages keeps using that copy for the thread history, so the CLI does not delete it. After the send, the CLI reads `chat.db` until Messages marks each message sent. It returns `ok: false` with `SEND_FAILED` if Messages marks it failed, or `SEND_UNCONFIRMED` if it is still pending after `--wait SECONDS` (default 60).
+
 ### Group chats
 
 ```bash
@@ -104,6 +114,6 @@ All commands output JSON to stdout with `{ok: true, data: ...}` on success or `{
 ## How it works
 
 - **Reading**: Direct SQLite queries against `~/Library/Messages/chat.db` (read-only)
-- **Sending**: AppleScript via `osascript` to Messages.app
+- **Sending**: AppleScript via `osascript` to Messages.app. File sends are confirmed in `chat.db` (`message.is_sent`, `message.error`, `attachment.transfer_state`)
 - **Contact resolution**: AppleScript queries to Contacts.app, with alias file override
 - **Name resolution**: Phone numbers in message threads are resolved to contact names via Contacts.app

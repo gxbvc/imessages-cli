@@ -44,4 +44,12 @@ Threads include `contact_name` resolved from Contacts.app. Group chats include `
 - **Group chat IDs**: get these from `imessages-cli chats`; use with `chat` and `send-group`
 - **Attachments**: message objects include `attachments` array with filename, mime_type, bytes when present
 - **Dollar signs in messages**: bash eats `$` in double-quoted args (e.g., `"$23"` → `"3"`). Use `--stdin` to pipe the message: `echo 'Costs $23' | imessages-cli send <contact> --stdin`
-- **VCF attachments don't send**: AppleScript-based sending fails silently for `.vcf` (vCard) files — the message shows "(!)" in Messages.app. Drag-and-drop in the Messages UI works fine. This may affect other non-media file types too.
+- **VCF attachments didn't send** (before 2026-09-27): `.vcf` files showed "(!)" in Messages.app. The failed rows had the same sandbox cause as below (file in `~/projects`, `transfer_state=6`). Not retested since the staging fix.
+
+## Media over SMS/MMS (regression note, 2026-09-27)
+
+- **Bug**: `send --sms --file /tmp/x.jpg` returned `ok:true`, but nothing reached the phone. imagent (the Messages daemon) is sandboxed and logs `open on /tmp/x.jpg: Operation not permitted`. chat.db then shows `message.error=4`, `is_sent=0`, `attachment.transfer_state=6`, and `attachment.filename` still at the original path. It affected iMessage and RCS file sends from `/tmp` and `~/projects` too.
+- **Fix**: the CLI copies each file to `~/Library/Messages/Attachments/imessages-cli/<uuid>/` before it sends. Do not delete those copies, because `attachment.filename` points at them. Then it polls chat.db. Success is `is_sent=1`, `error=0`, and `transfer_state=5` on every new outgoing message. `SEND_FAILED` means Messages marked it failed. `SEND_UNCONFIRMED` means it was still pending after `--wait` (default 60 s). Check `imessages-cli thread <contact>` before you retry, so you do not send twice.
+- **Send media over SMS**: `imessages-cli send +1XXXXXXXXXX "caption" --sms --file /path/a.jpg`. The caption goes as its own SMS, then the file as an MMS. The iPhone converts `.m4a` audio to `audio/amr` for MMS.
+- **Verify on the receiving side** (GXB Twilio test number only, never a live number or a person): `twilio api:core:messages:list --to +18177977334 --from +18176685828 --limit 5 -o json`. Look for an `MM...` sid with `numMedia` of 1. Get the content type with `twilio api:core:messages:media:list --message-sid MM... -o json`.
+- **Self-check**: `ruby test_send.rb` covers the failed, pending, and sent states. Details: `plans/fix-sms-attachments.md`.

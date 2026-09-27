@@ -29,6 +29,8 @@ require 'optparse'
 require 'yaml'
 require 'open3'
 require 'time'
+require 'fileutils'
+require 'securerandom'
 
 DB_PATH = File.expand_path("~/Library/Messages/chat.db")
 ALIASES_PATH = File.join(__dir__, "aliases.yml")
@@ -628,6 +630,94 @@ def benign_send_error?(stderr)
   BENIGN_SEND_ERROR_CODES.any? { |code| stderr.to_s.include?("(#{code})") }
 end
 
+# imagent (the Messages daemon) is sandboxed. It cannot read a file in /tmp or
+# ~/projects, so it logs "open ... Operation not permitted", marks the message
+# error=4 / transfer_state=6, and osascript still exits 0. Copy each file into
+# Messages' own attachment folder first (steipete/imsg does the same).
+# Messages keeps pointing at the staged copy, so do not delete it after a send.
+STAGING_DIR = File.expand_path('~/Library/Messages/Attachments/imessages-cli')
+
+def stage_attachment(path)
+  dir = File.join(STAGING_DIR, SecureRandom.uuid)
+  FileUtils.mkdir_p(dir)
+  dest = File.join(dir, File.basename(path))
+  FileUtils.cp(path, dest)
+  dest
+rescue SystemCallError => e
+  error("Could not copy #{path} into #{STAGING_DIR}: #{e.message}", 'STAGE_FAILED')
+end
+
+# osascript returns when Messages queues the send, so its exit status says
+# nothing about an attachment. Poll chat.db until every new outgoing message
+# is sent or has failed. attachment.transfer_state: 5 = finished, 6 = failed.
+TRANSFER_FINISHED = 5
+TRANSFER_FAILED = 6
+DEFAULT_SEND_WAIT = 60
+
+# Link previews add .pluginPayloadAttachment rows that can stay at
+# transfer_state 0 after a good send; only real files count.
+def real_attachment?(transfer_name)
+  !transfer_name.nil? && !transfer_name.end_with?('.pluginPayloadAttachment')
+end
+
+def max_message_rowid
+  open_db.get_first_value('SELECT MAX(ROWID) FROM message').to_i
+end
+
+def outgoing_messages_since(rowid, handle: nil, chat_rowid: nil)
+  target_sql, target = if chat_rowid
+    ['m.ROWID IN (SELECT message_id FROM chat_message_join WHERE chat_id = ?)', chat_rowid]
+  else
+    ['m.handle_id IN (SELECT ROWID FROM handle WHERE id = ?)', handle]
+  end
+  rows = open_db.execute(<<~SQL, [rowid, target])
+    SELECT m.ROWID, m.service, m.is_sent, m.error, a.transfer_state, a.transfer_name
+    FROM message m
+    LEFT JOIN message_attachment_join maj ON maj.message_id = m.ROWID
+    LEFT JOIN attachment a ON a.ROWID = maj.attachment_id
+    WHERE m.ROWID > ? AND m.is_from_me = 1 AND #{target_sql}
+    ORDER BY m.ROWID
+  SQL
+  rows.group_by { |r| r['ROWID'] }.map do |id, parts|
+    attachments = parts.select { |p| real_attachment?(p['transfer_name']) }
+    {
+      id: id,
+      service: parts.first['service'],
+      is_sent: parts.first['is_sent'] == 1,
+      error: parts.first['error'].to_i,
+      attachments: attachments.map { |p| { name: p['transfer_name'], transfer_state: p['transfer_state'] } }
+    }
+  end
+end
+
+def message_failed?(m)
+  m[:error] != 0 || m[:attachments].any? { |a| a[:transfer_state] == TRANSFER_FAILED }
+end
+
+def message_done?(m)
+  m[:is_sent] && m[:attachments].all? { |a| a[:transfer_state] == TRANSFER_FINISHED }
+end
+
+def confirm_send(since_rowid, expected:, wait:, handle: nil, chat_rowid: nil)
+  deadline = Time.now + wait
+  loop do
+    messages = outgoing_messages_since(since_rowid, handle: handle, chat_rowid: chat_rowid)
+    failed = messages.select { |m| message_failed?(m) }
+    unless failed.empty?
+      error("Messages could not send #{failed.length} of #{messages.length} message(s). " \
+            "For SMS/MMS, check that MMS Messaging is on in iPhone Settings > Apps > Messages " \
+            "and that the iPhone has cellular data.", 'SEND_FAILED', messages)
+    end
+    return messages if messages.length >= expected && messages.all? { |m| message_done?(m) }
+    if Time.now > deadline
+      error("Send not confirmed after #{wait}s: Messages has not marked the attachment sent. " \
+            "Check `imessages thread` before you retry, so you do not send it twice.",
+            'SEND_UNCONFIRMED', messages)
+    end
+    sleep 1
+  end
+end
+
 def send_via_applescript(phone, text: nil, files: [], sms: false)
   escaped_phone = phone.gsub('"', '\\"')
 
@@ -672,7 +762,13 @@ def cmd_send(contact_input, message_text, options = {})
   resolved = resolve_contact(contact_input)
   phone = resolved[:phone]
 
-  send_via_applescript(phone, text: has_text ? message_text : nil, files: files, sms: options[:sms])
+  staged = files.map { |f| stage_attachment(f) }
+  since_rowid = max_message_rowid unless staged.empty?
+  send_via_applescript(phone, text: has_text ? message_text : nil, files: staged, sms: options[:sms])
+  unless staged.empty?
+    confirmed = confirm_send(since_rowid, expected: staged.length + (has_text ? 1 : 0),
+                             wait: options[:wait] || DEFAULT_SEND_WAIT, handle: phone)
+  end
 
   result = {
     sent: true,
@@ -684,6 +780,7 @@ def cmd_send(contact_input, message_text, options = {})
   }
   result[:message] = message_text if has_text
   result[:attachments] = files.map { |f| File.basename(f) } unless files.empty?
+  result[:confirmed] = confirmed if confirmed
 
   success(result)
 end
@@ -706,12 +803,15 @@ def cmd_send_group(chat_id, message_text, options = {})
   chat_identifier = chat['chat_identifier'].gsub('"', '\\"')
   service = chat['service_name'] || 'iMessage'
 
+  staged = files.map { |f| stage_attachment(f) }
+  since_rowid = max_message_rowid unless staged.empty?
+
   send_lines = []
   if has_text
     escaped_message = message_text.gsub('\\', '\\\\\\\\').gsub('"', '\\"')
     send_lines << %Q{send "#{escaped_message}" to targetChat}
   end
-  files.each do |f|
+  staged.each do |f|
     escaped_path = f.gsub('\\', '\\\\\\\\').gsub('"', '\\"')
     send_lines << %Q{send POSIX file "#{escaped_path}" to targetChat}
   end
@@ -746,6 +846,11 @@ def cmd_send_group(chat_id, message_text, options = {})
     end
   end
 
+  unless staged.empty?
+    confirmed = confirm_send(since_rowid, expected: staged.length + (has_text ? 1 : 0),
+                             wait: options[:wait] || DEFAULT_SEND_WAIT, chat_rowid: chat['ROWID'])
+  end
+
   result = {
     sent: true,
     chat_id: chat_id.to_i,
@@ -753,6 +858,7 @@ def cmd_send_group(chat_id, message_text, options = {})
   }
   result[:message] = message_text if has_text
   result[:attachments] = files.map { |f| File.basename(f) } unless files.empty?
+  result[:confirmed] = confirmed if confirmed
 
   success(result)
 end
@@ -966,6 +1072,7 @@ begin
       puts "  --file PATH    Attach a file (can be repeated)"
       puts "  --sms          Send as SMS/RCS instead of iMessage"
       puts "  --stdin        Read message text from stdin"
+      puts "  --wait SECONDS With --file: how long to wait for Messages to confirm the send (default: #{DEFAULT_SEND_WAIT})"
       exit 0
     end
     contact = ARGV.shift
@@ -976,6 +1083,7 @@ begin
       opts.on('--file PATH', '--attachment PATH') { |v| options[:files] << v }
       opts.on('--sms', 'Send as SMS/RCS instead of iMessage') { options[:sms] = true }
       opts.on('--stdin', 'Read message text from stdin') { options[:stdin] = true }
+      opts.on('--wait SECONDS', Integer) { |v| options[:wait] = v }
     end.parse!
     message = read_message_arg(options)
     error("Usage: imessages send <contact> <message> or --file PATH or --stdin", 'USAGE') if (message.nil? || message.strip.empty?) && options[:files].empty?
@@ -987,6 +1095,7 @@ begin
       puts "  Send a message to a group chat"
       puts "  --file PATH    Attach a file (can be repeated)"
       puts "  --stdin        Read message text from stdin"
+      puts "  --wait SECONDS With --file: how long to wait for Messages to confirm the send (default: #{DEFAULT_SEND_WAIT})"
       exit 0
     end
     chat_id = ARGV.shift
@@ -996,6 +1105,7 @@ begin
     OptionParser.new do |opts|
       opts.on('--file PATH', '--attachment PATH') { |v| options[:files] << v }
       opts.on('--stdin', 'Read message text from stdin') { options[:stdin] = true }
+      opts.on('--wait SECONDS', Integer) { |v| options[:wait] = v }
     end.parse!
     message = read_message_arg(options)
     error("Usage: imessages send-group <chat_id> <message> or --file PATH or --stdin", 'USAGE') if (message.nil? || message.strip.empty?) && options[:files].empty?
