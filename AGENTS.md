@@ -2,6 +2,8 @@
 
 CLI for reading and sending iMessages. Reads from `~/Library/Messages/chat.db` (SQLite) for queries, AppleScript for sending.
 
+**Every text you send is prefixed with 🤖** (`send` and `send-group`; no opt-out, never doubled). This marks it as agent-written. Do not add the emoji yourself.
+
 Use the `imessages-cli` binary in PATH. For `send`, **do not** use `--text` or `--phone` flags — usage is positional: `imessages-cli send <contact> [message]`.
 
 ## Commands

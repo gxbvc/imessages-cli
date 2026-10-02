@@ -35,6 +35,11 @@ require 'securerandom'
 DB_PATH = File.expand_path("~/Library/Messages/chat.db")
 ALIASES_PATH = File.join(__dir__, "aliases.yml")
 
+# Every text this CLI sends starts with a robot emoji, so readers can tell
+# agent-written messages from ones Christian typed himself. Same convention as
+# slack-cli. There is deliberately no opt-out.
+ROBOT_PREFIX = "\u{1F916} "
+
 # Apple CoreData nanosecond timestamp epoch (2001-01-01 00:00:00 UTC)
 APPLE_EPOCH_OFFSET = 978307200
 NANOSECOND_FACTOR = 1_000_000_000
@@ -49,6 +54,11 @@ end
 
 def read_message_arg(options)
   options[:stdin] ? $stdin.read : ARGV.shift
+end
+
+# Prepend ROBOT_PREFIX once. An existing leading robot emoji is not doubled.
+def robot_prefixed(text)
+  "#{ROBOT_PREFIX}#{text.sub(/\A\s*\u{1F916}\s*/, '')}"
 end
 
 def success(data)
@@ -752,6 +762,7 @@ def cmd_send(contact_input, message_text, options = {})
   # Validate: need at least text or a file
   has_text = message_text && !message_text.strip.empty?
   error("Message text or --file is required", 'USAGE') if !has_text && files.empty?
+  message_text = robot_prefixed(message_text) if has_text
 
   # Validate files exist
   files.each do |f|
@@ -789,6 +800,7 @@ def cmd_send_group(chat_id, message_text, options = {})
   files = options[:files] || []
   has_text = message_text && !message_text.strip.empty?
   error("Message text or --file is required", 'USAGE') if !has_text && files.empty?
+  message_text = robot_prefixed(message_text) if has_text
 
   # Validate files exist
   files.each do |f|
@@ -1068,7 +1080,7 @@ begin
   when 'send'
     if show_subcmd_help
       puts "Usage: imessages send <contact> [message] [--file PATH] [--sms] [--stdin]"
-      puts "  Send a message to a contact"
+      puts "  Send a message to a contact (text is always prefixed with a robot emoji)"
       puts "  --file PATH    Attach a file (can be repeated)"
       puts "  --sms          Send as SMS/RCS instead of iMessage"
       puts "  --stdin        Read message text from stdin"
@@ -1092,7 +1104,7 @@ begin
   when 'send-group'
     if show_subcmd_help
       puts "Usage: imessages send-group <chat_id> [message] [--file PATH] [--stdin]"
-      puts "  Send a message to a group chat"
+      puts "  Send a message to a group chat (text is always prefixed with a robot emoji)"
       puts "  --file PATH    Attach a file (can be repeated)"
       puts "  --stdin        Read message text from stdin"
       puts "  --wait SECONDS With --file: how long to wait for Messages to confirm the send (default: #{DEFAULT_SEND_WAIT})"

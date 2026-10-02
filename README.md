@@ -53,6 +53,8 @@ imessages send "jane" "What's up?"         # By alias
 imessages send "jane" --sms "Hey!"         # Send as SMS/RCS (for Android contacts)
 ```
 
+Every text from `send` and `send-group` starts with 🤖, so people can tell agent messages from ones Christian typed. There is no flag to turn it off. A leading 🤖 in your text is not doubled. A send with only `--file` and no text has no prefix. slack-cli uses the same convention.
+
 #### Sending messages with dollar signs or special characters
 
 Use `--stdin` to pipe the message via stdin. This avoids bash shell expansion which eats `$` signs (e.g., `$23` becomes `3`):

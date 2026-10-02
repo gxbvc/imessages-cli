@@ -55,4 +55,8 @@ raise 'FAIL: link-preview payloads must not count as files' if real_attachment?(
 raise 'FAIL: a real file must count' unless real_attachment?('memo.m4a')
 raise 'FAIL: a text-only row has no file' if real_attachment?(nil)
 
+raise 'FAIL: text must get the robot prefix' unless robot_prefixed('hi') == "\u{1F916} hi"
+raise 'FAIL: robot prefix must not double' unless robot_prefixed("\u{1F916} hi") == "\u{1F916} hi"
+raise 'FAIL: robot prefix must not double without a space' unless robot_prefixed("\u{1F916}hi") == "\u{1F916} hi"
+
 puts 'OK: test_send.rb passed'
